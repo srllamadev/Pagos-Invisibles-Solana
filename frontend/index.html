@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GhostPay Sakura Bento</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-blobs" aria-hidden="true">
+      <span class="blob blob-a"></span>
+      <span class="blob blob-b"></span>
+      <span class="blob blob-c"></span>
+    </div>
+
+    <main class="shell">
+      <header class="bento hero reveal-up">
+        <div>
+          <p class="eyebrow">GhostPay • Solana Private Notes</p>
+          <h1>Sakura Bento Wallet</h1>
+          <p class="subtitle">
+            Commit, reveal opcional, stealth scan y spend desde vault en una UI
+            limpia y lista para integrar con Anchor.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="connectWallet" class="btn btn-primary">Conectar Phantom</button>
+          <button id="genDemo" class="btn btn-ghost">Generar Demo</button>
+          <p id="walletState" class="hint">Wallet: no conectada</p>
+        </div>
+      </header>
+
+      <section class="grid">
+        <article class="bento card reveal-up delay-1">
+          <h2>Commit</h2>
+          <p class="hint">Crear compromiso stealth con ECDH + hash.</p>
+          <form id="commitForm" class="stack">
+            <label>
+              Receptor (pubkey)
+              <input id="recipient" placeholder="Ej: 7x..." required />
+            </label>
+            <label>
+              Monto (u64)
+              <input id="amount" type="number" min="1" value="1000" required />
+            </label>
+            <label>
+              Nonce
+              <input id="nonce" type="number" min="1" value="1" required />
+            </label>
+            <button class="btn btn-primary" type="submit">Crear compromiso</button>
+          </form>
+          <pre id="commitOut" class="code"></pre>
+        </article>
+
+        <article class="bento card reveal-up delay-2">
+          <h2>Reveal</h2>
+          <p class="hint">Verificar apertura de recipient y amount.</p>
+          <form id="revealForm" class="stack">
+            <label>
+              Shared Secret Hash (hex)
+              <input id="sharedHash" placeholder="64 hex" required />
+            </label>
+            <label>
+              Recipient Blinding (hex)
+              <input id="recipientBlind" placeholder="64 hex" required />
+            </label>
+            <label>
+              Amount Blinding (hex)
+              <input id="amountBlind" placeholder="64 hex" required />
+            </label>
+            <button class="btn btn-rose" type="submit">Validar reveal</button>
+          </form>
+          <pre id="revealOut" class="code"></pre>
+        </article>
+
+        <article class="bento card reveal-up delay-3">
+          <h2>Stealth Scan</h2>
+          <p class="hint">Filtra notas detectables por scan key local.</p>
+          <form id="scanForm" class="stack">
+            <label>
+              Scan Private Key (hex)
+              <input id="scanPrivate" placeholder="64 hex" required />
+            </label>
+            <button class="btn btn-ghost" type="submit">Escanear notas</button>
+          </form>
+          <ul id="scanList" class="chip-list"></ul>
+        </article>
+
+        <article class="bento card reveal-up delay-4">
+          <h2>Vault Spend</h2>
+          <p class="hint">Simular spend seguro con nullifier.</p>
+          <form id="spendForm" class="stack">
+            <label>
+              Ghost Payment PDA
+              <input id="ghostPda" placeholder="Ej: Fg6..." required />
+            </label>
+            <label>
+              Spend Auth Opening (hex)
+              <input id="spendOpening" placeholder="64 hex" required />
+            </label>
+            <button class="btn btn-primary" type="submit">Derivar nullifier</button>
+          </form>
+          <pre id="spendOut" class="code"></pre>
+        </article>
+
+        
+      </section>
+    </main>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>
