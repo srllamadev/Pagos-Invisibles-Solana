@@ -1,34 +1,70 @@
+// @ts-nocheck
 // No imports needed: web3, anchor, pg and more are globally available
 
-describe("Test", () => {
-  it("initialize", async () => {
-    // Generate keypair for the new account
-    const newAccountKp = new web3.Keypair();
+const toLeU64 = (value: BN): Buffer => value.toArrayLike(Buffer, "le", 8);
 
-    // Send transaction
-    const data = new BN(42);
-    const txHash = await pg.program.methods
-      .initialize(data)
+const toBytes32 = (value: Uint8Array): number[] => Array.from(value);
+
+describe("GhostPay commitments", () => {
+  it("commits and later reveals recipient + amount", async () => {
+    const recipient = web3.Keypair.generate().publicKey;
+    const nonce = new BN(Date.now());
+    const amount = new BN(250_000);
+
+    const recipientBlinding = web3.Keypair.generate().publicKey.toBytes();
+    const amountBlinding = web3.Keypair.generate().publicKey.toBytes();
+    const ephemeralPubkey = web3.Keypair.generate().publicKey.toBytes();
+
+    const recipientCommitment = anchor.utils.sha256.hash(
+      Buffer.concat([recipient.toBuffer(), Buffer.from(recipientBlinding)])
+    );
+
+    const amountCommitment = anchor.utils.sha256.hash(
+      Buffer.concat([toLeU64(amount), Buffer.from(amountBlinding)])
+    );
+
+    const [ghostPaymentPda] = web3.PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("ghost_payment"),
+        pg.wallet.publicKey.toBuffer(),
+        toLeU64(nonce),
+      ],
+      pg.program.programId
+    );
+
+    await pg.program.methods
+      .createGhostPayment(
+        toBytes32(recipientCommitment),
+        toBytes32(amountCommitment),
+        toBytes32(ephemeralPubkey),
+        nonce
+      )
       .accounts({
-        newAccount: newAccountKp.publicKey,
+        ghostPayment: ghostPaymentPda,
         signer: pg.wallet.publicKey,
         systemProgram: web3.SystemProgram.programId,
       })
-      .signers([newAccountKp])
       .rpc();
-    console.log(`Use 'solana confirm -v ${txHash}' to see the logs`);
 
-    // Confirm transaction
-    await pg.connection.confirmTransaction(txHash);
+    await pg.program.methods
+      .revealPayment(
+        recipient,
+        toBytes32(recipientBlinding),
+        amount,
+        toBytes32(amountBlinding)
+      )
+      .accounts({
+        ghostPayment: ghostPaymentPda,
+        signer: pg.wallet.publicKey,
+      })
+      .rpc();
 
-    // Fetch the created account
-    const newAccount = await pg.program.account.newAccount.fetch(
-      newAccountKp.publicKey
+    const ghostPayment = await pg.program.account.ghostPayment.fetch(
+      ghostPaymentPda
     );
 
-    console.log("On-chain data is:", newAccount.data.toString());
-
-    // Check whether the data on-chain is equal to local 'data'
-    assert(data.eq(newAccount.data));
+    assert(ghostPayment.revealed === true);
+    assert(ghostPayment.revealedAmount.eq(amount));
+    assert(ghostPayment.revealedRecipient.equals(recipient));
   });
 });

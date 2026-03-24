@@ -1,217 +1,133 @@
 use anchor_lang::prelude::*;
-// ID del Solana Program, este espacio se llena automaticamente al haver el "build"
-declare_id!("");
+use anchor_lang::solana_program::hash::hashv;
 
-#[program] // Macro que convierte codigo de Rust a Solana. Apartir de aqui empieza tu codigo!
-pub mod biblioteca {
-    use super::*; // Importa todas los structs y enums definidos fuera del modulo
+declare_id!("Fg6PaFpoGXkYsidMpWxTWqkY3bQzQ4mXxvLw6L8x8F8k");
 
-    //////////////////////////// Instruccion: Crear Biblioteca /////////////////////////////////////
-    /*
-    Permite la creacion de una PDA (Program Derived Adress), un tipo especial de cuenta en solana que permite prescindir 
-    del uso de llaves privadas para la firma de transacciones. 
+#[program]
+pub mod pagos_invisibles_solana {
+	use super::*;
 
-    Esta cuenta contendra el objeto (struct) de tipo Biblioteca donde podremos almacenar los Libros. 
-    La creacion de la PDA depende de 3 cosas:
-        * Wallet address 
-        * Program ID 
-        * string representativo, regularmente relacionado con el nombre del proyecto
-    
-    La explicacion de esto continua en el struct NuevaBiblioteca
+	pub fn create_ghost_payment(
+		ctx: Context<CreateGhostPayment>,
+		hashed_recipient: [u8; 32],
+		amount_commitment: [u8; 32],
+		ephemeral_pubkey: [u8; 32],
+		nonce: u64,
+	) -> Result<()> {
+		let ghost_payment = &mut ctx.accounts.ghost_payment;
+		ghost_payment.payer = ctx.accounts.signer.key();
+		ghost_payment.hashed_recipient = hashed_recipient;
+		ghost_payment.amount_commitment = amount_commitment;
+		ghost_payment.ephemeral_pubkey = ephemeral_pubkey;
+		ghost_payment.nonce = nonce;
+		ghost_payment.revealed = false;
+		ghost_payment.revealed_recipient = Pubkey::default();
+		ghost_payment.revealed_amount = 0;
 
-    Parametros de entrada:
-        * nombre -> nombre de la biblioteca -> tipo string
-     */
-    pub fn crear_biblioteca(context: Context<NuevaBiblioteca>, nombre: String) -> Result<()> {
-        // "Context" siempre suele ir como primer parametro, ya que permite acceder al objeto o cuenta con el que queremos interactuar
-        // Dentro del context va al tipo de objeto o cuenta con el que deseamos interactuar. 
-        let owner_id = context.accounts.owner.key(); // Accedemos al wallet address del caller 
-        msg!("Owner id: {}", owner_id); // Print de verificacion
+		emit!(PaymentCommitted {
+			ghost_payment: ghost_payment.key(),
+			payer: ghost_payment.payer,
+			nonce,
+		});
 
-        let libros: Vec<Libro> = Vec::new(); // Crea un vector vacio 
+		Ok(())
+	}
 
-        // Creamos un Struct de tipo biblioteca y lo guardamos directamente 
-        context.accounts.biblioteca.set_inner(Biblioteca { 
-            owner: owner_id,
-            nombre,
-            libros,
-        });
-        Ok(()) // Representa una transaccion exitosa 
-    }
+	pub fn reveal_payment(
+		ctx: Context<RevealPayment>,
+		recipient: Pubkey,
+		recipient_blinding: [u8; 32],
+		amount: u64,
+		amount_blinding: [u8; 32],
+	) -> Result<()> {
+		let ghost_payment = &mut ctx.accounts.ghost_payment;
 
-    //////////////////////////// Instruccion: Agregar Libro /////////////////////////////////////
-    /*
-    Agrega un libro al vector de libros ontenido en el struct Biblioteca. 
-    En este caso el contexto empleado es el struct NuevoLibro. Mientras que NuevaBiblioteca permite crear 
-    Instancias de una Biblioteca. NuevoLibro permite crear y modificar los valores relacionados a cualquier
-    struct de tipo Libro.
+		let recipient_commitment = hashv(&[recipient.as_ref(), &recipient_blinding]).to_bytes();
+		require!(
+			recipient_commitment == ghost_payment.hashed_recipient,
+			GhostPayError::RecipientCommitmentMismatch
+		);
 
-    Parametros de entrada:
-        * nombre -> nombre del libro -> string
-        * paginas -> numero de paginas del libro -> u16
-     */ 
-    pub fn agregar_libro(context: Context<NuevoLibro>, nombre: String, paginas: u16) -> Result<()> {
-        require!( // Medida de seguridad para identificar que SOLO el owner de la biblioteca sea el que hace cambios en ella
-            context.accounts.biblioteca.owner == context.accounts.owner.key(), // Condicion, true -> continua, false -> error
-            Errores::NoEresElOwner // Codigo de error, ver enum Errores
-        ); 
+		let amount_le = amount.to_le_bytes();
+		let amount_commitment = hashv(&[&amount_le, &amount_blinding]).to_bytes();
+		require!(
+			amount_commitment == ghost_payment.amount_commitment,
+			GhostPayError::AmountCommitmentMismatch
+		);
 
-        let libro = Libro { // Creacion de un struct tipo Libro
-            nombre,
-            paginas,
-            disponible: true,
-        };
+		ghost_payment.revealed = true;
+		ghost_payment.revealed_recipient = recipient;
+		ghost_payment.revealed_amount = amount;
 
-        context.accounts.biblioteca.libros.push(libro); // Agrega el Libro al vector de libros de Biblioteca
+		emit!(PaymentRevealed {
+			ghost_payment: ghost_payment.key(),
+			revealer: ctx.accounts.signer.key(),
+			recipient,
+			amount,
+		});
 
-        Ok(()) // Transaccion exitosa
-    }
-
-    //////////////////////////// Instruccion: Eliminar Libro /////////////////////////////////////
-    /*
-    Elimina un libro apartir de su nombre. Error si libro no existe, Error si vector vacio. 
-
-    Parametros de entrada:
-        * nombre -> Nombre del libro -> string
-     */
-    pub fn eliminar_libro(context: Context<NuevoLibro>, nombre: String) -> Result<()> {
-        require!( // Medida de seguridad
-            context.accounts.biblioteca.owner == context.accounts.owner.key(),
-            Errores::NoEresElOwner
-        );
-
-        let libros = &mut context.accounts.biblioteca.libros; // Referencia mutable al vector de libros
-
-        for i in 0..libros.len() { // Se itera mediante el indice todo el contenido del vector en busca del libro a eliminar
-            if libros[i].nombre == nombre { // Si lo encuentra prodece a borrarlo mediante el metodo remove
-                libros.remove(i);
-                msg!("Libro {} eliminado!", nombre); // Mensaje de borrado exitoso
-                return Ok(()); // Transaccion exitosa
-            }
-        }
-        Err(Errores::LibroNoExiste.into()) // Transaccion fallida, nunca encontro el libro
-    }
-
-    //////////////////////////// Instruccion: Ver Libros /////////////////////////////////////
-    /*
-    Muestra en el log de la transaccion el contenido completo del vector de libros de la Biblioteca
-
-    Parametros de entrada:
-        Ninguno
-     */
-    pub fn ver_libros(context: Context<NuevoLibro>) -> Result<()> {
-        require!( // Medida de seguridad 
-            context.accounts.biblioteca.owner == context.accounts.owner.key(),
-            Errores::NoEresElOwner
-        );
-
-        // :#? requiere que NuevoLibro tenga atributo Debug. Permite la visualizacion completa del vector en el log
-        msg!("La lista de libros actualmente es: {:#?}", context.accounts.biblioteca.libros); // Print en log
-        Ok(()) // Transaccion exitosa 
-    }
-
-    
-    //////////////////////////// Instruccion: Alternar Estado /////////////////////////////////////
-    /* 
-    Cambia el estado de disponible de false a true o de true a false.
-
-    Parametros de entrada:
-        * nombre -> Nombre del libro -> string
-     */
-    pub fn alternar_estado(context: Context<NuevoLibro>, nombre: String) -> Result<()> {
-        require!( // Medida de seguridad
-            context.accounts.biblioteca.owner == context.accounts.owner.key(),
-            Errores::NoEresElOwner
-        );
-
-        let libros = &mut context.accounts.biblioteca.libros; // Referencia mutable al vector de libros
-        for i in 0..libros.len() { // Se itera mediante el indice el vector de libros
-            let estado = libros[i].disponible;  // Se almacena el estado del vector actual
-
-            if libros[i].nombre == nombre { // Si ecuentra el nombre del libro procede a cambiar el valor del estado 
-                let nuevo_estado = !estado;
-                libros[i].disponible = nuevo_estado;
-                msg!("El libro: {} ahora tiene un valor de disponibilidad: {}", nombre, nuevo_estado); // log print de la nueva disponibilidad
-                return Ok(()); // Transaccion exitosa
-            }
-        }
-
-        Err(Errores::LibroNoExiste.into()) // Transaccion fallida, libro no existe
-    }
-
+		Ok(())
+	}
 }
 
-/*
-Codigos de error
-Todos los codigos se almacenan en un enum con la siguiente estructura:
-#[msg("MENSAJE DE ERROR")] (dentro de las comillas)
-NombreDelError, (En camel case)
-*/
+#[derive(Accounts)]
+#[instruction(_hashed_recipient: [u8; 32], _amount_commitment: [u8; 32], _ephemeral_pubkey: [u8; 32], nonce: u64)]
+pub struct CreateGhostPayment<'info> {
+	#[account(
+		init,
+		payer = signer,
+		space = 8 + GhostPayment::INIT_SPACE,
+		seeds = [b"ghost_payment", signer.key().as_ref(), &nonce.to_le_bytes()],
+		bump
+	)]
+	pub ghost_payment: Account<'info, GhostPayment>,
+	#[account(mut)]
+	pub signer: Signer<'info>,
+	pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RevealPayment<'info> {
+	#[account(mut)]
+	pub ghost_payment: Account<'info, GhostPayment>,
+	pub signer: Signer<'info>,
+}
+
+#[account]
+pub struct GhostPayment {
+	pub payer: Pubkey,
+	pub hashed_recipient: [u8; 32],
+	pub amount_commitment: [u8; 32],
+	pub ephemeral_pubkey: [u8; 32],
+	pub nonce: u64,
+	pub revealed: bool,
+	pub revealed_recipient: Pubkey,
+	pub revealed_amount: u64,
+}
+
+impl GhostPayment {
+	pub const INIT_SPACE: usize = 32 + 32 + 32 + 32 + 8 + 1 + 32 + 8;
+}
+
+#[event]
+pub struct PaymentCommitted {
+	pub ghost_payment: Pubkey,
+	pub payer: Pubkey,
+	pub nonce: u64,
+}
+
+#[event]
+pub struct PaymentRevealed {
+	pub ghost_payment: Pubkey,
+	pub revealer: Pubkey,
+	pub recipient: Pubkey,
+	pub amount: u64,
+}
+
 #[error_code]
-pub enum Errores {
-    #[msg("Error, no eres el propietario de la biblioteca que deseas modificar")]
-    NoEresElOwner,
-    #[msg("Error, el libro con el que deseas interactuar no existe")]
-    LibroNoExiste,
-}
-
-#[account] // Especifica que el strcut es una cuenta que se almacenara en la blockchain
-#[derive(InitSpace)] // Genera la constante INIT_SPACE y determina el espacio de almacenamiento necesario 
-pub struct Biblioteca { // Define la Biblioteca
-    owner: Pubkey, // Pubkey es un formato de llave publica de 32 bytes 
-
-    #[max_len(60)] // Cantidad maxima de caracteres del string: nombre
-    nombre: String,
-
-    #[max_len(10)] // Tamaño maximo del vector libros 
-    libros: Vec<Libro>,
-}
-
-/*
-Struct interno o secundario (No es una cuenta). Se define por derive y cuenta con los siguientes atributos:
-    * AnchorSerialize -> Permite guardar el struct en la cuenta 
-    * AnchorDeserialize -> Permite leer su contenido desde la cuenta 
-    * Clone -> Para copiar su contenido o valores 
-    * InitSpace -> Calcula el tamaño necesario para ser almacenado en la blockchain
-    * PartialEq -> Para usar sus valores y compararlos con "=="
-    * Debug -> Para mostrarlo en log con ":?" o ":#?"
-*/
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace, PartialEq, Debug)]
-pub struct Libro {
-    #[max_len(60)]
-    nombre: String,
-
-    // Los siguientes datos no rquieren de max_len porque ya estan definidos (numero de 16 bits y false o true)
-    paginas: u16, 
-
-    disponible: bool,
-}
-
-
-// Creacion de los contextos para las instrucciones (funciones)
-#[derive(Accounts)] // Especifica que este struct describe las cuentas que se requieren para determinada instruccion
-pub struct NuevaBiblioteca<'info> { // contexto de la instruccion
-    #[account(mut)] 
-    pub owner: Signer<'info>, // Se define que el owner como el que pagara la transaccion, por eso es mut, para que cambie el balance de la cuenta
-
-    #[account(
-        init, // Inidica que al llamar la instruccuion se creara una cuenta
-        // puede ser remplazado por "init_if_needed" para que solo se cree una vez por caller
-        payer = owner, // Se especifica que quien paga el llamado a la instruccion, en este caso llama la instruccion 
-        space = Biblioteca::INIT_SPACE + 8, // Se calcula el espacio requerido para almacenar el Solana Program On-Chain
-        seeds = [b"biblioteca", owner.key().as_ref()], // Se especifica que la cuenta es una PDA que depende de un string y el id del owner
-        bump // Metodo para determinar el el id de la biblioteca en base a lo anterior 
-    )]
-    pub biblioteca: Account<'info, Biblioteca>, // Se especifica que la cuenta creada (PDA) almacenara la biblioteca 
-
-    pub system_program: Program<'info, System>, // Programa necesario para crear la cuenta 
-}
-
-// Contexto para la creacion y modificacion de libros 
-#[derive(Accounts)] // Especifica que este struct se requiere para todas las instrucciones relacionadas con la creacion o modificacion de Libro
-pub struct NuevoLibro<'info> {
-    pub owner: Signer<'info>, // El owner de la cuenta es quien paga la transaccion
-
-    #[account(mut)] 
-    pub biblioteca: Account<'info, Biblioteca>, // Se marca biblioteca como mutable porque se modificara tanto el vector como los libros que contiene
+pub enum GhostPayError {
+	#[msg("The recipient opening does not match the stored commitment.")]
+	RecipientCommitmentMismatch,
+	#[msg("The amount opening does not match the stored commitment.")]
+	AmountCommitmentMismatch,
 }
