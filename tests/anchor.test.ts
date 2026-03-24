@@ -75,6 +75,14 @@ const findGhostPaymentPda = (nonce: BN): web3.PublicKey =>
     pg.program.programId
   )[0];
 
+const findVaultAuthorityPda = (
+  ghostPayment: web3.PublicKey
+): web3.PublicKey =>
+  web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_authority"), ghostPayment.toBuffer()],
+    pg.program.programId
+  )[0];
+
 describe("GhostPay commitments", () => {
   it("commits via ECDH and reveals recipient + amount", async () => {
     const recipient = web3.Keypair.generate().publicKey;
@@ -240,14 +248,22 @@ describe("GhostPay commitments", () => {
       200_000
     );
 
-    const vaultOwner = web3.Keypair.generate();
-    await pg.connection.requestAirdrop(vaultOwner.publicKey, web3.LAMPORTS_PER_SOL);
+    const vaultAuthorityPda = findVaultAuthorityPda(ghostPaymentPda);
 
     const vaultAta = await splToken.getOrCreateAssociatedTokenAccount(
       pg.connection,
       pg.wallet.keypair,
       mint,
-      vaultOwner.publicKey
+      vaultAuthorityPda,
+      true
+    );
+
+    const recipientStealth = web3.Keypair.generate().publicKey;
+    const recipientAta = await splToken.getOrCreateAssociatedTokenAccount(
+      pg.connection,
+      pg.wallet.keypair,
+      mint,
+      recipientStealth
     );
 
     const vaultDeposit = new BN(25_000);
@@ -266,7 +282,9 @@ describe("GhostPay commitments", () => {
         ghostPayment: ghostPaymentPda,
         signer: pg.wallet.publicKey,
         signerTokenAccount: signerAta.address,
+        vaultAuthority: vaultAuthorityPda,
         vaultTokenAccount: vaultAta.address,
+        tokenMint: mint,
         tokenProgram: splToken.TOKEN_PROGRAM_ID,
         systemProgram: web3.SystemProgram.programId,
       })
@@ -274,6 +292,44 @@ describe("GhostPay commitments", () => {
 
     const note = await pg.program.account.ghostPayment.fetch(ghostPaymentPda);
     assert(note.vaultTokenAccount.equals(vaultAta.address));
+    assert(note.vaultAuthority.equals(vaultAuthorityPda));
+    assert(note.tokenMint.equals(mint));
     assert(note.vaultDepositAmount.eq(vaultDeposit));
+
+    const nullifier = deriveNullifier(ghostPaymentPda, spendAuthOpening);
+    const [nullifierRecordPda] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("nullifier"), Buffer.from(nullifier)],
+      pg.program.programId
+    );
+
+    await pg.program.methods
+      .spendFromVault(
+        toBytes32(nullifier),
+        toBytes32(spendAuthOpening),
+        vaultDeposit
+      )
+      .accounts({
+        ghostPayment: ghostPaymentPda,
+        nullifierRecord: nullifierRecordPda,
+        signer: pg.wallet.publicKey,
+        vaultAuthority: vaultAuthorityPda,
+        vaultTokenAccount: vaultAta.address,
+        recipientTokenAccount: recipientAta.address,
+        tokenMint: mint,
+        tokenProgram: splToken.TOKEN_PROGRAM_ID,
+        systemProgram: web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const vaultAfter = await splToken.getAccount(pg.connection, vaultAta.address);
+    const recipientAfter = await splToken.getAccount(
+      pg.connection,
+      recipientAta.address
+    );
+    const noteAfterSpend = await pg.program.account.ghostPayment.fetch(ghostPaymentPda);
+
+    assert(vaultAfter.amount === BigInt(0));
+    assert(recipientAfter.amount === BigInt(vaultDeposit.toString()));
+    assert(noteAfterSpend.spent === true);
   });
 });

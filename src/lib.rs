@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::hash::hashv;
-use anchor_spl::token::{transfer, Token, TokenAccount, Transfer};
+use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("Fg6PaFpoGXkYsidMpWxTWqkY3bQzQ4mXxvLw6L8x8F8k");
 
@@ -29,6 +29,8 @@ pub mod pagos_invisibles_solana {
 		ghost_payment.revealed_recipient = Pubkey::default();
 		ghost_payment.revealed_amount = 0;
 		ghost_payment.vault_token_account = Pubkey::default();
+		ghost_payment.vault_authority = Pubkey::default();
+		ghost_payment.token_mint = Pubkey::default();
 		ghost_payment.vault_deposit_amount = 0;
 		ghost_payment.spent = false;
 
@@ -74,6 +76,8 @@ pub mod pagos_invisibles_solana {
 		ghost_payment.revealed_recipient = Pubkey::default();
 		ghost_payment.revealed_amount = 0;
 		ghost_payment.vault_token_account = ctx.accounts.vault_token_account.key();
+		ghost_payment.vault_authority = ctx.accounts.vault_authority.key();
+		ghost_payment.token_mint = ctx.accounts.token_mint.key();
 		ghost_payment.vault_deposit_amount = vault_deposit_amount;
 		ghost_payment.spent = false;
 
@@ -173,6 +177,85 @@ pub mod pagos_invisibles_solana {
 
 		Ok(())
 	}
+
+	pub fn spend_from_vault(
+		ctx: Context<SpendFromVault>,
+		nullifier: [u8; 32],
+		spend_auth_opening: [u8; 32],
+		withdraw_amount: u64,
+	) -> Result<()> {
+		let ghost_payment = &mut ctx.accounts.ghost_payment;
+
+		require!(!ghost_payment.spent, GhostPayError::GhostPaymentAlreadySpent);
+		require!(
+			ghost_payment.vault_token_account == ctx.accounts.vault_token_account.key(),
+			GhostPayError::VaultAccountMismatch
+		);
+		require!(
+			ghost_payment.vault_authority == ctx.accounts.vault_authority.key(),
+			GhostPayError::VaultAuthorityMismatch
+		);
+		require!(
+			ghost_payment.token_mint == ctx.accounts.token_mint.key(),
+			GhostPayError::VaultMintMismatch
+		);
+		require!(
+			withdraw_amount == ghost_payment.vault_deposit_amount,
+			GhostPayError::MustSpendFullVaultAmount
+		);
+
+		let ownership_commitment =
+			hashv(&[ghost_payment.key().as_ref(), &spend_auth_opening]).to_bytes();
+		require!(
+			ownership_commitment == ghost_payment.spend_auth_commitment,
+			GhostPayError::InvalidSpendAuthorizationProof
+		);
+
+		let expected_nullifier = hashv(&[
+			ghost_payment.key().as_ref(),
+			&spend_auth_opening,
+			b"nullifier",
+		])
+		.to_bytes();
+		require!(
+			expected_nullifier == nullifier,
+			GhostPayError::NullifierDerivationMismatch
+		);
+
+		let nullifier_record = &mut ctx.accounts.nullifier_record;
+		nullifier_record.nullifier = nullifier;
+		nullifier_record.ghost_payment = ghost_payment.key();
+		nullifier_record.owner = ctx.accounts.signer.key();
+		nullifier_record.created_at_slot = Clock::get()?.slot;
+
+		let signer_seeds: &[&[u8]] = &[
+			b"vault_authority",
+			ghost_payment.key().as_ref(),
+			&[ctx.bumps.vault_authority],
+		];
+		let signer = &[signer_seeds];
+
+		let cpi_accounts = Transfer {
+			from: ctx.accounts.vault_token_account.to_account_info(),
+			to: ctx.accounts.recipient_token_account.to_account_info(),
+			authority: ctx.accounts.vault_authority.to_account_info(),
+		};
+		let cpi_program = ctx.accounts.token_program.to_account_info();
+		let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+		transfer(cpi_ctx, withdraw_amount)?;
+
+		ghost_payment.spent = true;
+		ghost_payment.vault_deposit_amount = 0;
+
+		emit!(VaultSpent {
+			ghost_payment: ghost_payment.key(),
+			nullifier,
+			recipient_token_account: ctx.accounts.recipient_token_account.key(),
+			amount: withdraw_amount,
+		});
+
+		Ok(())
+	}
 }
 
 #[derive(Accounts)]
@@ -205,9 +288,20 @@ pub struct CreateGhostPaymentWithVault<'info> {
 	#[account(mut)]
 	pub signer: Signer<'info>,
 	#[account(mut)]
+	#[account(constraint = signer_token_account.owner == signer.key())]
+	#[account(constraint = signer_token_account.mint == token_mint.key())]
 	pub signer_token_account: Account<'info, TokenAccount>,
+	#[account(
+		seeds = [b"vault_authority", ghost_payment.key().as_ref()],
+		bump
+	)]
+	/// CHECK: PDA authority used only for token signer seeds.
+	pub vault_authority: UncheckedAccount<'info>,
 	#[account(mut)]
+	#[account(constraint = vault_token_account.owner == vault_authority.key())]
+	#[account(constraint = vault_token_account.mint == token_mint.key())]
 	pub vault_token_account: Account<'info, TokenAccount>,
+	pub token_mint: Account<'info, Mint>,
 	pub token_program: Program<'info, Token>,
 	pub system_program: Program<'info, System>,
 }
@@ -237,6 +331,37 @@ pub struct ConsumeNullifier<'info> {
 	pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+#[instruction(nullifier: [u8; 32])]
+pub struct SpendFromVault<'info> {
+	#[account(mut)]
+	pub ghost_payment: Account<'info, GhostPayment>,
+	#[account(
+		init,
+		payer = signer,
+		space = 8 + NullifierRecord::INIT_SPACE,
+		seeds = [b"nullifier", &nullifier],
+		bump
+	)]
+	pub nullifier_record: Account<'info, NullifierRecord>,
+	#[account(mut)]
+	pub signer: Signer<'info>,
+	#[account(
+		seeds = [b"vault_authority", ghost_payment.key().as_ref()],
+		bump
+	)]
+	/// CHECK: PDA authority used only for token signer seeds.
+	pub vault_authority: UncheckedAccount<'info>,
+	#[account(mut, constraint = vault_token_account.owner == vault_authority.key())]
+	#[account(constraint = vault_token_account.mint == token_mint.key())]
+	pub vault_token_account: Account<'info, TokenAccount>,
+	#[account(mut, constraint = recipient_token_account.mint == token_mint.key())]
+	pub recipient_token_account: Account<'info, TokenAccount>,
+	pub token_mint: Account<'info, Mint>,
+	pub token_program: Program<'info, Token>,
+	pub system_program: Program<'info, System>,
+}
+
 #[account]
 pub struct GhostPayment {
 	pub payer: Pubkey,
@@ -250,12 +375,14 @@ pub struct GhostPayment {
 	pub revealed_recipient: Pubkey,
 	pub revealed_amount: u64,
 	pub vault_token_account: Pubkey,
+	pub vault_authority: Pubkey,
+	pub token_mint: Pubkey,
 	pub vault_deposit_amount: u64,
 	pub spent: bool,
 }
 
 impl GhostPayment {
-	pub const INIT_SPACE: usize = 32 + 32 + 32 + 32 + 32 + 32 + 8 + 1 + 32 + 8 + 32 + 8 + 1;
+	pub const INIT_SPACE: usize = 32 + 32 + 32 + 32 + 32 + 32 + 8 + 1 + 32 + 8 + 32 + 32 + 32 + 8 + 1;
 }
 
 #[account]
@@ -292,6 +419,14 @@ pub struct NullifierConsumed {
 	pub owner: Pubkey,
 }
 
+#[event]
+pub struct VaultSpent {
+	pub ghost_payment: Pubkey,
+	pub nullifier: [u8; 32],
+	pub recipient_token_account: Pubkey,
+	pub amount: u64,
+}
+
 #[error_code]
 pub enum GhostPayError {
 	#[msg("The recipient opening does not match the stored commitment.")]
@@ -308,4 +443,12 @@ pub enum GhostPayError {
 	NullifierDerivationMismatch,
 	#[msg("Provided shared secret hash does not match stored scan tag.")]
 	SharedSecretHashMismatch,
+	#[msg("Vault token account mismatch for this ghost payment.")]
+	VaultAccountMismatch,
+	#[msg("Vault authority PDA mismatch for this ghost payment.")]
+	VaultAuthorityMismatch,
+	#[msg("Vault mint mismatch for this ghost payment.")]
+	VaultMintMismatch,
+	#[msg("For now, the note must spend its full vaulted amount in one transaction.")]
+	MustSpendFullVaultAmount,
 }

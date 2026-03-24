@@ -79,6 +79,14 @@ const findGhostPaymentPda = (nonce: BN): web3.PublicKey =>
 		pg.program.programId
 	)[0];
 
+const findVaultAuthorityPda = (
+	ghostPayment: web3.PublicKey
+): web3.PublicKey =>
+	web3.PublicKey.findProgramAddressSync(
+		[Buffer.from("vault_authority"), ghostPayment.toBuffer()],
+		pg.program.programId
+	)[0];
+
 const createGhostCommitmentPayload = (params: {
 	recipient: web3.PublicKey;
 	amount: BN;
@@ -193,14 +201,22 @@ await splToken.mintTo(
 	500_000
 );
 
-const vaultOwner = web3.Keypair.generate();
-await pg.connection.requestAirdrop(vaultOwner.publicKey, web3.LAMPORTS_PER_SOL);
+const vaultAuthorityPda = findVaultAuthorityPda(ghostPaymentPda);
 
 const vaultAta = await splToken.getOrCreateAssociatedTokenAccount(
 	pg.connection,
 	pg.wallet.keypair,
 	mint,
-	vaultOwner.publicKey
+	vaultAuthorityPda,
+	true
+);
+
+const recipientStealth = web3.Keypair.generate().publicKey;
+const recipientAta = await splToken.getOrCreateAssociatedTokenAccount(
+	pg.connection,
+	pg.wallet.keypair,
+	mint,
+	recipientStealth
 );
 
 const vaultDeposit = new BN(75_000);
@@ -219,7 +235,9 @@ await pg.program.methods
 		ghostPayment: ghostPaymentPda,
 		signer: pg.wallet.publicKey,
 		signerTokenAccount: signerAta.address,
+		vaultAuthority: vaultAuthorityPda,
 		vaultTokenAccount: vaultAta.address,
+		tokenMint: mint,
 		tokenProgram: splToken.TOKEN_PROGRAM_ID,
 		systemProgram: web3.SystemProgram.programId,
 	})
@@ -228,18 +246,29 @@ await pg.program.methods
 const ownGhostPayments = await scanForOwnedGhostPayments(receiverScanPrivate);
 console.log("Ghost payments matched by scan key:", ownGhostPayments.length);
 
-const nullifier = deriveNullifier(ghostPaymentPda, spendAuthOpening);
-const [nullifierRecordPda] = web3.PublicKey.findProgramAddressSync(
-	[Buffer.from("nullifier"), Buffer.from(nullifier)],
+const spendNullifier = deriveNullifier(ghostPaymentPda, spendAuthOpening);
+const [vaultSpendNullifierPda] = web3.PublicKey.findProgramAddressSync(
+	[Buffer.from("nullifier"), Buffer.from(spendNullifier)],
 	pg.program.programId
 );
 
 await pg.program.methods
-	.consumeNullifier(toBytes32(nullifier), toBytes32(spendAuthOpening))
+	.spendFromVault(
+		toBytes32(spendNullifier),
+		toBytes32(spendAuthOpening),
+		vaultDeposit
+	)
 	.accounts({
 		ghostPayment: ghostPaymentPda,
-		nullifierRecord: nullifierRecordPda,
+		nullifierRecord: vaultSpendNullifierPda,
 		signer: pg.wallet.publicKey,
+		vaultAuthority: vaultAuthorityPda,
+		vaultTokenAccount: vaultAta.address,
+		recipientTokenAccount: recipientAta.address,
+		tokenMint: mint,
+		tokenProgram: splToken.TOKEN_PROGRAM_ID,
 		systemProgram: web3.SystemProgram.programId,
 	})
 	.rpc();
+
+console.log("Vault spend executed to stealth recipient ATA:", recipientAta.address.toString());
