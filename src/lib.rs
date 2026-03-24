@@ -14,6 +14,7 @@ pub mod pagos_invisibles_solana {
 		amount_commitment: [u8; 32],
 		ephemeral_pubkey: [u8; 32],
 		scan_tag: [u8; 32],
+		spend_auth_commitment: [u8; 32],
 		nonce: u64,
 	) -> Result<()> {
 		let ghost_payment = &mut ctx.accounts.ghost_payment;
@@ -22,6 +23,7 @@ pub mod pagos_invisibles_solana {
 		ghost_payment.amount_commitment = amount_commitment;
 		ghost_payment.ephemeral_pubkey = ephemeral_pubkey;
 		ghost_payment.scan_tag = scan_tag;
+		ghost_payment.spend_auth_commitment = spend_auth_commitment;
 		ghost_payment.nonce = nonce;
 		ghost_payment.revealed = false;
 		ghost_payment.revealed_recipient = Pubkey::default();
@@ -45,6 +47,7 @@ pub mod pagos_invisibles_solana {
 		amount_commitment: [u8; 32],
 		ephemeral_pubkey: [u8; 32],
 		scan_tag: [u8; 32],
+		spend_auth_commitment: [u8; 32],
 		nonce: u64,
 		vault_deposit_amount: u64,
 	) -> Result<()> {
@@ -65,6 +68,7 @@ pub mod pagos_invisibles_solana {
 		ghost_payment.amount_commitment = amount_commitment;
 		ghost_payment.ephemeral_pubkey = ephemeral_pubkey;
 		ghost_payment.scan_tag = scan_tag;
+		ghost_payment.spend_auth_commitment = spend_auth_commitment;
 		ghost_payment.nonce = nonce;
 		ghost_payment.revealed = false;
 		ghost_payment.revealed_recipient = Pubkey::default();
@@ -86,22 +90,30 @@ pub mod pagos_invisibles_solana {
 		ctx: Context<RevealPayment>,
 		recipient: Pubkey,
 		recipient_blinding: [u8; 32],
+		shared_secret_hash: [u8; 32],
 		amount: u64,
 		amount_blinding: [u8; 32],
 	) -> Result<()> {
 		let ghost_payment = &mut ctx.accounts.ghost_payment;
 
-		let recipient_commitment = hashv(&[recipient.as_ref(), &recipient_blinding]).to_bytes();
+		let recipient_commitment =
+			hashv(&[recipient.as_ref(), &recipient_blinding, &shared_secret_hash]).to_bytes();
 		require!(
 			recipient_commitment == ghost_payment.hashed_recipient,
 			GhostPayError::RecipientCommitmentMismatch
 		);
 
 		let amount_le = amount.to_le_bytes();
-		let amount_commitment = hashv(&[&amount_le, &amount_blinding]).to_bytes();
+		let amount_commitment = hashv(&[&amount_le, &amount_blinding, &shared_secret_hash]).to_bytes();
 		require!(
 			amount_commitment == ghost_payment.amount_commitment,
 			GhostPayError::AmountCommitmentMismatch
+		);
+
+		let expected_scan_tag = hashv(&[&ghost_payment.ephemeral_pubkey, &shared_secret_hash]).to_bytes();
+		require!(
+			expected_scan_tag == ghost_payment.scan_tag,
+			GhostPayError::SharedSecretHashMismatch
 		);
 
 		ghost_payment.revealed = true;
@@ -118,14 +130,31 @@ pub mod pagos_invisibles_solana {
 		Ok(())
 	}
 
-	pub fn consume_nullifier(ctx: Context<ConsumeNullifier>, nullifier: [u8; 32]) -> Result<()> {
+	pub fn consume_nullifier(
+		ctx: Context<ConsumeNullifier>,
+		nullifier: [u8; 32],
+		spend_auth_opening: [u8; 32],
+	) -> Result<()> {
 		let ghost_payment = &mut ctx.accounts.ghost_payment;
 
 		require!(!ghost_payment.spent, GhostPayError::GhostPaymentAlreadySpent);
+
+		let ownership_commitment =
+			hashv(&[ghost_payment.key().as_ref(), &spend_auth_opening]).to_bytes();
 		require!(
-			ghost_payment.payer == ctx.accounts.signer.key()
-				|| ghost_payment.revealed_recipient == ctx.accounts.signer.key(),
-			GhostPayError::UnauthorizedSpendAttempt
+			ownership_commitment == ghost_payment.spend_auth_commitment,
+			GhostPayError::InvalidSpendAuthorizationProof
+		);
+
+		let expected_nullifier = hashv(&[
+			ghost_payment.key().as_ref(),
+			&spend_auth_opening,
+			b"nullifier",
+		])
+		.to_bytes();
+		require!(
+			expected_nullifier == nullifier,
+			GhostPayError::NullifierDerivationMismatch
 		);
 
 		let nullifier_record = &mut ctx.accounts.nullifier_record;
@@ -147,7 +176,7 @@ pub mod pagos_invisibles_solana {
 }
 
 #[derive(Accounts)]
-#[instruction(_hashed_recipient: [u8; 32], _amount_commitment: [u8; 32], _ephemeral_pubkey: [u8; 32], _scan_tag: [u8; 32], nonce: u64)]
+#[instruction(_hashed_recipient: [u8; 32], _amount_commitment: [u8; 32], _ephemeral_pubkey: [u8; 32], _scan_tag: [u8; 32], _spend_auth_commitment: [u8; 32], nonce: u64)]
 pub struct CreateGhostPayment<'info> {
 	#[account(
 		init,
@@ -163,7 +192,7 @@ pub struct CreateGhostPayment<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(_hashed_recipient: [u8; 32], _amount_commitment: [u8; 32], _ephemeral_pubkey: [u8; 32], _scan_tag: [u8; 32], nonce: u64)]
+#[instruction(_hashed_recipient: [u8; 32], _amount_commitment: [u8; 32], _ephemeral_pubkey: [u8; 32], _scan_tag: [u8; 32], _spend_auth_commitment: [u8; 32], nonce: u64)]
 pub struct CreateGhostPaymentWithVault<'info> {
 	#[account(
 		init,
@@ -215,6 +244,7 @@ pub struct GhostPayment {
 	pub amount_commitment: [u8; 32],
 	pub ephemeral_pubkey: [u8; 32],
 	pub scan_tag: [u8; 32],
+	pub spend_auth_commitment: [u8; 32],
 	pub nonce: u64,
 	pub revealed: bool,
 	pub revealed_recipient: Pubkey,
@@ -225,7 +255,7 @@ pub struct GhostPayment {
 }
 
 impl GhostPayment {
-	pub const INIT_SPACE: usize = 32 + 32 + 32 + 32 + 32 + 8 + 1 + 32 + 8 + 32 + 8 + 1;
+	pub const INIT_SPACE: usize = 32 + 32 + 32 + 32 + 32 + 32 + 8 + 1 + 32 + 8 + 32 + 8 + 1;
 }
 
 #[account]
@@ -272,6 +302,10 @@ pub enum GhostPayError {
 	InvalidVaultDepositAmount,
 	#[msg("This ghost payment has already been spent.")]
 	GhostPaymentAlreadySpent,
-	#[msg("Signer is not authorized to consume this nullifier.")]
-	UnauthorizedSpendAttempt,
+	#[msg("Provided spend authorization opening is invalid.")]
+	InvalidSpendAuthorizationProof,
+	#[msg("Provided nullifier does not match the expected derivation.")]
+	NullifierDerivationMismatch,
+	#[msg("Provided shared secret hash does not match stored scan tag.")]
+	SharedSecretHashMismatch,
 }
